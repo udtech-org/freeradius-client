@@ -2454,5 +2454,686 @@ int main(int argc, char *argv[]) {
 
 ---
 
+## 14. 端口映射功能详解
+
+### 14.1 端口映射的作用
+
+#### 什么是端口映射？
+
+端口映射（Port Mapping）是将**物理或虚拟终端设备**（如TTY串口、虚拟终端）与**RADIUS协议中的NAS-Port属性**进行映射的功能。
+
+#### 为什么需要端口映射？
+
+在RADIUS协议中，**NAS-Port**（RADIUS属性ID=5）是一个重要的属性，用于标识用户连接的物理端口。但在现代系统中，存在以下问题：
+
+```
+问题1: TTY名称不连续
+/dev/ttyS0, /dev/ttyS1 → 这些TTY设备对应的物理端口编号
+但系统TTY可能有很多，编号不连续
+
+问题2: 虚拟终端和物理端口
+pts/0, pts/1 → 伪终端（SSH、Telnet等）
+没有对应的物理端口号
+
+问题3: 多路复用设备
+一个物理端口可能承载多个虚拟连接
+需要统一管理端口标识
+```
+
+#### 端口映射的解决方案
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    port-id-map                          │
+│                                                         │
+│  /dev/ttyS0          →  9                              │
+│  /dev/ttyS1          →  10                             │
+│  /dev/ttyS2          →  11                             │
+│  pts/0               →  101                            │
+│  pts/1               →  102                            │
+│                                                         │
+│  TTY名称                     NAS-Port ID                │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 14.2 配置文件格式
+
+#### 默认配置文件位置
+
+```
+/etc/radiusclient/port-id-map
+```
+
+#### 配置文件格式说明
+
+```bash
+# 格式：TTY设备名称(制表符或空格分隔)端口ID
+#
+#ttyname (as returned by ttyname(3))	port-id
+
+/dev/tty1	1
+/dev/tty2	2
+/dev/tty3	3
+/dev/tty4	4
+/dev/tty5	5
+/dev/tty6	6
+/dev/ttyS0	9
+/dev/ttyS1	10
+/dev/ttyS2	11
+/dev/ttyS3	12
+```
+
+#### 格式规则
+
+1. **注释行**：以`#`开头的行会被忽略
+2. **空行**：空行会被忽略
+3. **映射规则**：每行一个映射，格式为`TTY名称` + `空白字符` + `端口ID`
+4. **空白字符**：支持空格或Tab制表符作为分隔符
+5. **TTY名称**：可以是完整路径（`/dev/ttyS0`）或相对路径（`ttyS0`）
+
+#### 示例配置文件
+
+```bash
+# 串口设备
+/dev/ttyS0	9
+/dev/ttyS1	10
+/dev/ttyS2	11
+/dev/ttyS3	12
+/dev/ttyS4	13
+/dev/ttyS5	14
+
+# 物理终端
+/dev/tty1	1
+/dev/tty2	2
+/dev/tty3	3
+/dev/tty4	4
+
+# 伪终端（SSH/Telnet）
+pts/0		101
+pts/1		102
+pts/2		103
+pts/3		104
+
+# USB转串口
+/dev/ttyUSB0	20
+/dev/ttyUSB1	21
+/dev/ttyUSB2	22
+
+# 虚拟串口
+/dev/pts/0	101
+/dev/pts/1	102
+```
+
+### 14.3 工作原理
+
+#### 内部数据结构
+
+```c
+// 内部链表结构 (lib/clientid.c)
+struct map2id_s {
+    char *name;           // TTY设备名称
+    uint32_t id;          // 映射的端口ID
+    struct map2id_s *next; // 指向下一个节点
+};
+```
+
+#### 处理流程
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    处理流程                                 │
+│                                                            │
+│  1. 初始化阶段                                              │
+│     rc_read_config()                                       │
+│        ↓                                                   │
+│     rc_read_mapfile(rh, "port-id-map")                     │
+│        ↓                                                   │
+│     读取配置文件，建立内存链表                              │
+│        ↓                                                   │
+│     rh->map2id_list  ──→  链表                             │
+│                                                            │
+│  2. 查询阶段                                                │
+│     用户登录                                                │
+│        ↓                                                   │
+│     获取当前TTY: ttyname(0) → "/dev/pts/0"                │
+│        ↓                                                   │
+│     调用 rc_map2id(rh, "/dev/pts/0")                       │
+│        ↓                                                   │
+│     遍历链表，查找匹配项                                    │
+│        ↓                                                   │
+│     返回端口ID: 101                                        │
+│                                                            │
+│  3. 应用阶段                                                │
+│     rc_avpair_add(rh, &send, PW_NAS_PORT, 101, ...)        │
+│        ↓                                                   │
+│     发送到RADIUS服务器                                     │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### 核心函数实现
+
+##### rc_read_mapfile() - 读取映射文件
+
+```c
+// lib/clientid.c:30-90
+int rc_read_mapfile(rc_handle *rh, char const *filename)
+{
+    FILE *mapfd;
+    char buffer[1024];
+    char *c, *name, *id;
+    struct map2id_s *p;
+    int lnr = 0;
+
+    // 打开映射文件
+    mapfd = fopen(filename, "r");
+    if (mapfd == NULL) {
+        rc_log(LOG_ERR, "无法打开映射文件: %s", filename);
+        return -1;
+    }
+
+    // 逐行读取
+    while (fgets(buffer, sizeof(buffer), mapfd) != NULL) {
+        lnr++;
+
+        // 跳过注释和空行
+        if ((*buffer == '#') || (*buffer == '\n') || (*buffer == '\0'))
+            continue;
+
+        // 解析 "ttyname    portid"
+        c = strchr(buffer, ' ');
+        if (!c) c = strchr(buffer, '\t');
+        
+        if (c) {
+            *c = '\0';  // 分割ttyname
+            c++;        // 移动到portid
+            
+            // 跳过空白字符
+            while(*c && isspace(*c)) c++;
+            
+            // 创建节点
+            p = malloc(sizeof(*p));
+            p->name = strdup(buffer);
+            p->id = atoi(c);
+            
+            // 插入链表头部
+            p->next = rh->map2id_list;
+            rh->map2id_list = p;
+        } else {
+            rc_log(LOG_ERR, "格式错误: %s 第%d行", filename, lnr);
+            fclose(mapfd);
+            return -1;
+        }
+    }
+
+    fclose(mapfd);
+    return 0;
+}
+```
+
+##### rc_map2id() - 查询TTY对应的端口ID
+
+```c
+// lib/clientid.c:98-118
+uint32_t rc_map2id(rc_handle const *rh, char const *name)
+{
+    struct map2id_s *p;
+    char ttyname[PATH_MAX];
+    unsigned pos = 0;
+
+    // 处理相对路径
+    *ttyname = '\0';
+    if (*name != '/') {
+        strcpy(ttyname, "/dev/");
+        pos = 5;
+    }
+
+    // 拼接完整路径
+    strlcpy(&ttyname[pos], name, sizeof(ttyname)-pos);
+
+    // 遍历链表查找
+    for (p = rh->map2id_list; p; p = p->next) {
+        if (!strcmp(ttyname, p->name)) {
+            return p->id;  // 找到匹配项
+        }
+    }
+
+    // 未找到
+    rc_log(LOG_WARNING, "未找到TTY %s 的映射", ttyname);
+    return 0;
+}
+```
+
+### 14.4 实际应用场景
+
+#### 场景1：多串口服务器的端口管理
+
+**场景描述**：
+一个工业控制服务器有8个串口，每个串口连接不同的设备。用户通过不同的串口登录系统，需要在RADIUS请求中标识用户使用的是哪个串口。
+
+**配置文件**：
+
+```bash
+# /etc/radiusclient/port-id-map
+#
+# 串口号:物理位置 → 逻辑端口ID
+
+# Modem端口
+/dev/ttyS0	1	# Modem1 - 北区
+/dev/ttyS1	2	# Modem2 - 南区
+
+# 控制台端口
+/dev/ttyS2	9	# Console1
+/dev/ttyS3	10	# Console2
+
+# 数据采集端口
+/dev/ttyS4	17	# 数据采集器1
+/dev/ttyS5	18	# 数据采集器2
+/dev/ttyS6	19	# 数据采集器3
+/dev/ttyS7	20	# 数据采集器4
+```
+
+**RADIUS服务器端配置**：
+
+```
+# FreeRADIUS服务器 users文件
+# 根据NAS-Port限制用户访问
+
+user1	NAS-Port == 1, NAS-Port == 2
+		Service-Type = Login-User,
+		Reply-Message = "允许访问Modem端口"
+
+user2	NAS-Port >= 17, NAS-Port <= 20
+		Service-Type = Login-User,
+		Reply-Message = "允许访问数据采集端口"
+
+admin	NAS-Port == 9, NAS-Port == 10
+		Service-Type = Administrative-User,
+		Reply-Message = "管理员权限"
+```
+
+#### 场景2：SSH登录的伪终端管理
+
+**场景描述**：
+公司有多个SSH服务器，每个SSH连接使用伪终端（pts）。需要追踪用户从哪个终端登录，便于审计和安全追踪。
+
+**配置文件**：
+
+```bash
+# /etc/radiusclient/port-id-map
+#
+# 伪终端映射到服务器端口范围
+
+# 服务器1的SSH连接
+Server1:pts/0	101
+Server1:pts/1	102
+Server1:pts/2	103
+...
+Server1:pts/99	199
+
+# 服务器2的SSH连接
+Server2:pts/0	201
+Server2:pts/1	202
+Server2:pts/2	203
+...
+Server2:pts/99	299
+```
+
+**登录脚本示例**：
+
+```bash
+#!/bin/bash
+# /usr/sbin/login.radius
+
+TTY=$(tty)           # 获取当前TTY: /dev/pts/0
+PORT_ID=$(rc_map2id "$TTY")  # 查询端口ID
+
+# 发送到RADIUS服务器进行认证
+radauth "$PORT_ID" username password
+```
+
+#### 场景3：VPN接入的端口追踪
+
+**场景描述**：
+VPN服务器为每个VPN会话分配一个内部端口号，用于区分不同的VPN用户和会话。
+
+**配置文件**：
+
+```bash
+# /etc/radiusclient/port-id-map
+#
+# VPN会话ID映射
+
+# PPTP VPN
+pptp:001	1001
+pptp:002	1002
+pptp:003	1003
+...
+pptp:999	1999
+
+# L2TP VPN
+l2tp:001	2001
+l2tp:002	2002
+...
+l2tp:999	2999
+
+# OpenVPN
+ovpn:001	3001
+ovpn:002	3002
+...
+ovpn:999	3999
+```
+
+#### 场景4：物联网设备的端口映射
+
+**场景描述**：
+IoT网关连接多个传感器设备，每个设备映射到一个逻辑端口，便于管理和计费。
+
+**配置文件**：
+
+```bash
+# /etc/radiusclient/port-id-map
+#
+# IoT设备端口映射
+
+# 温度传感器
+sensor:temp:001	5001
+sensor:temp:002	5002
+sensor:temp:003	5003
+
+# 湿度传感器
+sensor:humid:001	5101
+sensor:humid:002	5102
+sensor:humid:003	5103
+
+# 摄像头
+camera:cam:001	6001
+camera:cam:002	6002
+camera:cam:003	6003
+```
+
+### 14.5 API函数说明
+
+#### 14.5.1 rc_read_mapfile()
+
+**函数原型**：
+
+```c
+int rc_read_mapfile(rc_handle *rh, char const *filename);
+```
+
+**功能**：读取TTY到端口ID的映射文件
+
+**参数**：
+- `rh`: 配置句柄
+- `filename`: 映射文件路径
+
+**返回值**：
+- `0`: 成功
+- `-1`: 失败
+
+**使用示例**：
+
+```c
+rc_handle *rh;
+
+rh = rc_read_config("/etc/radiusclient/radiusclient.conf");
+
+// 读取映射文件
+if (rc_read_mapfile(rh, rc_conf_str(rh, "mapfile")) != 0) {
+    fprintf(stderr, "读取映射文件失败\n");
+    exit(1);
+}
+```
+
+**内部处理流程**：
+
+```
+1. fopen(filename, "r")
+2. 逐行读取文件
+3. 解析每行：ttyname + 空白 + portid
+4. 创建struct map2id_s节点
+5. 插入到rh->map2id_list链表
+6. fclose()
+7. 返回0
+```
+
+#### 14.5.2 rc_map2id()
+
+**函数原型**：
+
+```c
+uint32_t rc_map2id(rc_handle const *rh, char const *name);
+```
+
+**功能**：根据TTY名称查询对应的端口ID
+
+**参数**：
+- `rh`: 配置句柄
+- `name`: TTY设备名称（可以是完整路径或相对路径）
+
+**返回值**：
+- 端口ID（如果找到）
+- `0`（如果未找到）
+
+**使用示例**：
+
+```c
+uint32_t port_id;
+const char *tty = "/dev/pts/0";
+
+// 查询端口ID
+port_id = rc_map2id(rh, tty);
+
+if (port_id == 0) {
+    printf("警告: 未找到TTY %s 的映射，使用默认端口0\n", tty);
+} else {
+    printf("TTY %s 对应的端口ID: %u\n", tty, port_id);
+}
+
+// 在认证请求中使用
+rc_avpair_add(rh, &send, PW_NAS_PORT, &port_id, sizeof(port_id), 0);
+```
+
+**查找算法**：
+
+```c
+uint32_t rc_map2id(rc_handle const *rh, char const *name) {
+    // 1. 处理相对路径（添加/dev/前缀）
+    char full_path[PATH_MAX];
+    if (name[0] != '/') {
+        strcpy(full_path, "/dev/");
+        strcat(full_path, name);
+    } else {
+        strcpy(full_path, name);
+    }
+
+    // 2. 遍历链表查找
+    for (struct map2id_s *p = rh->map2id_list; p != NULL; p = p->next) {
+        if (strcmp(full_path, p->name) == 0) {
+            return p->id;  // 找到，返回端口ID
+        }
+    }
+
+    // 3. 未找到
+    return 0;
+}
+```
+
+#### 14.5.3 rc_map2id_free()
+
+**函数原型**：
+
+```c
+void rc_map2id_free(rc_handle *rh);
+```
+
+**功能**：释放映射文件加载时分配的内存
+
+**参数**：
+- `rh`: 配置句柄
+
+**使用示例**：
+
+```c
+// 程序结束时清理
+rc_map2id_free(rh);
+rc_destroy(rh);
+```
+
+**清理过程**：
+
+```c
+void rc_map2id_free(rc_handle *rh) {
+    struct map2id_s *p, *next;
+
+    if (rh->map2id_list == NULL)
+        return;
+
+    // 遍历链表，释放每个节点
+    for (p = rh->map2id_list; p != NULL; p = next) {
+        next = p->next;
+        free(p->name);  // 释放TTY名称字符串
+        free(p);        // 释放节点内存
+    }
+
+    rh->map2id_list = NULL;
+}
+```
+
+#### 14.5.4 在认证请求中的使用
+
+**完整示例**：
+
+```c
+#include <freeradius-client.h>
+
+int authenticate_with_port_mapping(const char *username, 
+                                   const char *password) {
+    rc_handle *rh;
+    VALUE_PAIR *send = NULL, *received = NULL;
+    uint32_t port_id;
+    char ttyname[PATH_MAX];
+    char msg[PW_MAX_MSG_SIZE];
+    int result;
+
+    // 1. 初始化
+    rh = rc_read_config("/etc/radiusclient/radiusclient.conf");
+    rc_read_dictionary(rh, rc_conf_str(rh, "dictionary"));
+    rc_read_mapfile(rh, rc_conf_str(rh, "mapfile"));  // 加载端口映射
+
+    // 2. 获取当前TTY并查询端口ID
+    const char *tty = ttyname(0);  // 获取当前TTY
+    if (tty) {
+        port_id = rc_map2id(rh, tty);
+        printf("当前TTY: %s, 端口ID: %u\n", tty, port_id);
+    } else {
+        port_id = 0;
+        printf("无法获取TTY，使用端口ID: 0\n");
+    }
+
+    // 3. 构建认证请求
+    rc_avpair_add(rh, &send, PW_USER_NAME, (void *)username, -1, 0);
+    rc_avpair_add(rh, &send, PW_USER_PASSWORD, (void *)password, -1, 0);
+    
+    // 添加NAS-Port（从映射文件获取）
+    if (port_id > 0) {
+        rc_avpair_add(rh, &send, PW_NAS_PORT, &port_id, sizeof(port_id), 0);
+    }
+
+    // 4. 发送认证请求
+    result = rc_auth(rh, port_id, send, &received, msg);
+
+    // 5. 处理结果
+    if (result == OK_RC) {
+        printf("✓ 认证成功！\n");
+    } else if (result == REJECT_RC) {
+        printf("✗ 认证被拒绝: %s\n", msg);
+    } else {
+        printf("✗ 认证失败: 错误码 %d\n", result);
+    }
+
+    // 6. 清理资源
+    rc_avpair_free(send);
+    rc_avpair_free(received);
+    rc_map2id_free(rh);  // 释放映射内存
+    rc_destroy(rh);
+
+    return result;
+}
+```
+
+### 14.6 配置注意事项
+
+#### 常见问题
+
+**问题1: 映射文件不存在**
+
+```bash
+# 解决方案：创建默认配置文件
+cp /usr/share/freeradius-client/port-id-map \
+   /etc/radiusclient/port-id-map
+
+# 或在radiusclient.conf中注释掉mapfile配置
+# mapfile		/etc/radiusclient/port-id-map
+```
+
+**问题2: TTY名称不在映射文件中**
+
+```bash
+# 查看当前TTY
+$ tty
+/dev/pts/0
+
+# 添加到映射文件
+echo "/dev/pts/0	101" >> /etc/radiusclient/port-id-map
+```
+
+**问题3: 映射文件权限问题**
+
+```bash
+# 设置正确权限
+chmod 644 /etc/radiusclient/port-id-map
+chown root:root /etc/radiusclient/port-id-map
+```
+
+#### 最佳实践
+
+1. **定期更新映射**：如果系统配置变化，需要及时更新映射文件
+2. **使用有意义的端口ID**：根据物理位置或设备类型分配端口ID，便于识别
+3. **添加注释**：在映射文件中添加注释说明每个端口的用途
+4. **保留范围**：为不同类型的设备保留不同的端口ID范围
+5. **日志监控**：定期检查RADIUS服务器日志，确保端口ID正确
+
+### 14.7 总结
+
+#### 核心要点
+
+1. **端口映射是将TTY设备映射为数字ID的功能**
+   - 解决TTY名称复杂、不连续的问题
+   - 在RADIUS请求中提供端口标识
+
+2. **配置文件格式简单**
+   - `TTY名称` + `空白字符` + `端口ID`
+   - 支持注释和空行
+
+3. **API函数提供完整的映射管理**
+   - `rc_read_mapfile()`: 加载映射
+   - `rc_map2id()`: 查询端口ID
+   - `rc_map2id_free()`: 释放资源
+
+4. **广泛应用于各种场景**
+   - 串口服务器
+   - SSH/Telnet登录
+   - VPN接入
+   - IoT设备管理
+
+5. **配置灵活**
+   - 可以映射任何类型的设备
+   - 端口ID范围可自定义
+   - 支持动态更新
+
+---
+
 *文档版本：1.0*  
 *最后更新：2026-05-23*
